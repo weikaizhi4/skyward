@@ -212,7 +212,7 @@ pub mod kms {
     use drm::Device;
     use std::collections::HashMap;
     use std::fs::{File, OpenOptions};
-    use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
     use std::time::{Duration, Instant};
 
     /// How long the display may take to complete a commit.
@@ -229,11 +229,10 @@ pub mod kms {
     impl Device for Card {}
     impl ControlDevice for Card {}
 
-    /// A single-plane dumb buffer presented to ADDFB2, so the framebuffer
-    /// keeps the buffer's own pixel format.
-    struct Planar<'a>(&'a DumbBuffer);
+    /// One-plane buffer for ADDFB2.
+    struct Planar<'a, B: buffer::Buffer + ?Sized>(&'a B);
 
-    impl PlanarBuffer for Planar<'_> {
+    impl<B: buffer::Buffer + ?Sized> PlanarBuffer for Planar<'_, B> {
         fn size(&self) -> (u32, u32) {
             buffer::Buffer::size(self.0)
         }
@@ -254,6 +253,82 @@ pub mod kms {
         }
     }
 
+    /// ION_IOC_ALLOC: _IOWR('I', 0, 24 bytes); returns a dma-buf fd.
+    const ION_IOC_ALLOC: libc::c_int = 0xC018_4900u32 as libc::c_int;
+
+    /// ION dma-buf imported through PRIME, for drivers whose dumb buffers fail.
+    struct IonBuffer {
+        size: (u32, u32),
+        format: DrmFourcc,
+        pitch: u32,
+        handle: buffer::Handle,
+        map: *mut u8,
+        len: usize,
+        _fd: OwnedFd,
+    }
+
+    impl IonBuffer {
+        fn new(card: &Card, size: (u32, u32), format: DrmFourcc, bpp: u32) -> Result<Self> {
+            #[repr(C)]
+            struct Alloc {
+                len: u64,
+                heap_id_mask: u32,
+                flags: u32,
+                fd: i32,
+                unused: u32,
+            }
+            let pitch = size.0 * bpp / 8;
+            let len = u64::from(pitch) * u64::from(size.1);
+            let ion = OpenOptions::new().read(true).write(true).open("/dev/ion").context("open /dev/ion")?;
+            let mut last = None;
+            // Try system, DMA/CMA, then custom heaps.
+            for mask in [1u32, 1 << 2, 1 << 16] {
+                let mut alloc = Alloc { len, heap_id_mask: mask, flags: 0, fd: -1, unused: 0 };
+                let rc = unsafe { libc::ioctl(ion.as_raw_fd(), ION_IOC_ALLOC, &mut alloc) };
+                if rc == 0 && alloc.fd >= 0 {
+                    let fd = unsafe { OwnedFd::from_raw_fd(alloc.fd) };
+                    let handle = card.prime_fd_to_buffer(fd.as_fd()).context("import the ION buffer into DRM")?;
+                    let map = unsafe {
+                        libc::mmap(std::ptr::null_mut(), len as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0)
+                    };
+                    if map == libc::MAP_FAILED {
+                        return Err(std::io::Error::last_os_error()).context("mmap the ION buffer");
+                    }
+                    return Ok(IonBuffer { size, format, pitch, handle, map: map.cast(), len: len as usize, _fd: fd });
+                }
+                last = Some(std::io::Error::last_os_error());
+            }
+            Err(anyhow!("ION allocation failed: {}", last.unwrap_or_else(|| std::io::Error::from_raw_os_error(0))))
+        }
+    }
+
+    impl buffer::Buffer for IonBuffer {
+        fn size(&self) -> (u32, u32) {
+            self.size
+        }
+        fn format(&self) -> DrmFourcc {
+            self.format
+        }
+        fn pitch(&self) -> u32 {
+            self.pitch
+        }
+        fn handle(&self) -> buffer::Handle {
+            self.handle
+        }
+    }
+
+    impl Drop for IonBuffer {
+        fn drop(&mut self) {
+            unsafe { libc::munmap(self.map.cast(), self.len) };
+        }
+    }
+
+    #[allow(dead_code)]
+    enum Backing {
+        Dumb(DumbBuffer),
+        Ion(IonBuffer),
+    }
+
     /// Byte order of the scanout buffer against the canvas's RGBA.
     #[derive(Clone, Copy, Debug)]
     enum Order {
@@ -262,12 +337,13 @@ pub mod kms {
     }
 
     struct Buf {
-        db: DumbBuffer,
+        _backing: Backing,
         fb: framebuffer::Handle,
         /// The buffer mapped for writing for as long as the surface lives;
         /// mapping it per frame costs a page fault per page on every frame.
         map: *mut u8,
         len: usize,
+        pitch: u32,
     }
 
     /// A KMS object's properties by name, with their current values.
@@ -278,8 +354,13 @@ pub mod kms {
             let values = card.get_properties(handle).context("read properties")?;
             let mut map = HashMap::new();
             for (&id, &value) in values.iter() {
-                let info = card.get_property(id).context("read property")?;
-                map.insert(info.name().to_string_lossy().into_owned(), (id, value));
+                // drm-ffi avoids drm's panic on empty RANGE values.
+                let mut vals = Vec::new();
+                let mut enums = Vec::new();
+                let info = drm_ffi::mode::get_property(card.as_fd(), id.into(), Some(&mut vals), Some(&mut enums))
+                    .with_context(|| format!("read property {id:?}"))?;
+                let name = unsafe { std::ffi::CStr::from_ptr(info.name.as_ptr()) }.to_string_lossy().into_owned();
+                map.insert(name, (id, value));
             }
             Ok(Props(map))
         }
@@ -621,16 +702,28 @@ pub mod kms {
                 .ok_or_else(|| anyhow!("the primary planes share none of the 32-bit RGB formats"))?;
 
             let make = || -> Result<Buf> {
-                let db = card.create_dumb_buffer((w, h), fourcc, 32).context("create dumb buffer")?;
-                let fb = card.add_planar_framebuffer(&Planar(&db), FbCmd2Flags::empty()).context("add framebuffer")?;
-                let len = buffer::Buffer::pitch(&db) as usize * h as usize;
-                let offset = drm_ffi::mode::dumbbuffer::map(card.as_fd(), buffer::Buffer::handle(&db).into(), 0, 0).context("map dumb buffer")?.offset;
-                let fd = card.as_fd().as_raw_fd();
-                let map = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, offset as libc::off_t) };
-                if map == libc::MAP_FAILED {
-                    return Err(std::io::Error::last_os_error()).context("mmap dumb buffer");
+                match card.create_dumb_buffer((w, h), fourcc, 32) {
+                    Ok(db) => {
+                        let fb = card.add_planar_framebuffer(&Planar(&db), FbCmd2Flags::empty()).context("add framebuffer")?;
+                        let len = buffer::Buffer::pitch(&db) as usize * h as usize;
+                        let pitch = buffer::Buffer::pitch(&db);
+                        let offset = drm_ffi::mode::dumbbuffer::map(card.as_fd(), buffer::Buffer::handle(&db).into(), 0, 0).context("map dumb buffer")?.offset;
+                        let fd = card.as_fd().as_raw_fd();
+                        let map = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, offset as libc::off_t) };
+                        if map == libc::MAP_FAILED {
+                            return Err(std::io::Error::last_os_error()).context("mmap dumb buffer");
+                        }
+                        Ok(Buf { _backing: Backing::Dumb(db), fb, map: map.cast(), len, pitch })
+                    }
+                    Err(dumb) => {
+                        // SPRD's dumb buffers need CMA; use ION when it fails.
+                        let ion = IonBuffer::new(&card, (w, h), fourcc, 32)
+                            .with_context(|| format!("create dumb buffer ({dumb}); ION fallback"))?;
+                        let fb = card.add_planar_framebuffer(&Planar(&ion), FbCmd2Flags::empty()).context("add the ION framebuffer")?;
+                        let (map, len, pitch) = (ion.map, ion.len, ion.pitch);
+                        Ok(Buf { _backing: Backing::Ion(ion), fb, map, len, pitch })
+                    }
                 }
-                Ok(Buf { db, fb, map: map.cast(), len })
             };
             let bufs = [make()?, make()?, make()?];
 
@@ -836,7 +929,9 @@ pub mod kms {
     impl Drop for KmsSurface {
         fn drop(&mut self) {
             for buf in &self.bufs {
-                unsafe { libc::munmap(buf.map.cast(), buf.len) };
+                if matches!(&buf._backing, Backing::Dumb(_)) {
+                    unsafe { libc::munmap(buf.map.cast(), buf.len) };
+                }
             }
         }
     }
@@ -861,7 +956,7 @@ pub mod kms {
             }
             let order = self.order;
             let buf = &self.bufs[self.back];
-            let pitch = buffer::Buffer::pitch(&buf.db) as usize;
+            let pitch = buf.pitch as usize;
             let row = self.w as usize * 4;
             let dst = unsafe { std::slice::from_raw_parts_mut(buf.map, buf.len) };
             for y in 0..self.h as usize {
