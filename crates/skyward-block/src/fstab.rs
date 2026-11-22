@@ -51,11 +51,29 @@ pub fn entries(text: &str) -> Vec<Entry> {
     out
 }
 
-/// Every entry of the phone's own table, read from wherever the table is.
+/// The bootloader's hardware name, e.g. `ums512_1h190`.
+fn hardware() -> Option<String> {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
+    cmdline
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("androidboot.hardware="))
+        .map(str::to_string)
+}
+
+/// Read the phone's table, trying `fstab.<hardware>` first.
 fn table() -> Result<Vec<Entry>> {
+    let mut files: Vec<String> = Vec::new();
+    if let Some(hardware) = hardware() {
+        files.push(format!("/vendor/etc/fstab.{hardware}"));
+        files.push(format!("/odm/etc/fstab.{hardware}"));
+    }
+    files.extend(FILES.iter().map(|file| (*file).to_string()));
+    // Stock Unisoc recovery table.
+    files.push("/etc/recovery.fstab".to_string());
+    files.push("/system/etc/recovery.fstab".to_string());
     let mut out = Vec::new();
-    for file in FILES {
-        let text = match std::fs::read_to_string(file) {
+    for file in files {
+        let text = match std::fs::read_to_string(&file) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e).with_context(|| format!("read {file}")),

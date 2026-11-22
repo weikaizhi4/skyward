@@ -34,7 +34,12 @@ impl Decryptor {
     pub fn start(job: Job) -> Result<Decryptor> {
         let worker = Worker::start("decrypt", move |tell| {
             tell.tell(match job {
-                Job::Open => Ended::Opened(with_key_service(data::open_without_credential)),
+                // Unencrypted data needs no key service; try it first.
+                Job::Open => Ended::Opened(match data::open_plain() {
+                    Ok(opening) => Ok(opening),
+                    Err(plain) => with_key_service(data::open_without_credential)
+                        .map_err(|encrypted| format!("{plain:#}; {encrypted}")),
+                }),
                 Job::Unlock { closed, user, credential } => {
                     Ended::Unlocked(with_key_service(|service| data::unlock(service, &closed, user, &credential)))
                 }

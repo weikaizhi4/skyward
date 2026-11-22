@@ -162,6 +162,30 @@ pub struct Opening {
     pub closed: Vec<Closed>,
 }
 
+/// Mount an unencrypted data partition directly, without dm-crypt or KeyMint.
+pub fn open_plain() -> Result<Opening> {
+    let entries = skyward_block::fstab::read(MOUNT)?;
+    let entry = entries.first().with_context(|| format!("the phone's own table says nothing about {MOUNT}"))?;
+    let encrypted = entry.extras.iter().any(|e| {
+        e.starts_with("metadata_encryption=") || e.starts_with("fileencryption=") || e == "forceencrypt" || e.starts_with("encryptable=")
+    });
+    anyhow::ensure!(!encrypted, "the phone's table says its data partition is encrypted");
+    let device = skyward_block::fstab::device(entry)?;
+    let mounted = match mount::is_mount_point(Path::new(MOUNT))? {
+        true => None,
+        false => {
+            std::fs::create_dir_all(MOUNT).with_context(|| format!("make {MOUNT}"))?;
+            mount::mount(Path::new(&device), Path::new(MOUNT), &entry.filesystem, &entry.options)?;
+            Some(Opened { mapped: device.into(), filesystem: entry.filesystem.clone(), checked: None })
+        }
+    };
+    if let Err(e) = show_owner_storage() {
+        // No shared storage is still a usable data mount.
+        eprintln!("shared storage not shown: {e:#}");
+    }
+    Ok(Opening { mounted, closed: Vec::new() })
+}
+
 /// Open the data partition as far as it opens with nothing a user knows:
 /// mount it where it is not mounted, let in the keys of the files that
 /// belong to no one user and of each user's files readable before they
