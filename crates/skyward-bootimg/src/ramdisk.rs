@@ -1,5 +1,8 @@
 use anyhow::{bail, Context, Result};
 use cpio::{NewcBuilder, NewcReader};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::ffi::{CString, OsStr};
 use std::fs;
 use std::io::{Cursor, Read, Write};
@@ -49,11 +52,14 @@ pub struct Ramdisk {
 }
 
 impl Ramdisk {
-    /// Unpack an LZ4 (legacy framing) compressed newc archive, as Android
-    /// boot images carry.
+    /// Unpack a gzip (Android 11 and older) or LZ4 newc archive.
     pub fn decode(compressed: &[u8]) -> Result<Self> {
         let mut cpio = Vec::new();
-        lz4_flex::frame::FrameDecoder::new(compressed).read_to_end(&mut cpio).context("lz4 decode")?;
+        if compressed.starts_with(&[0x1f, 0x8b]) {
+            GzDecoder::new(compressed).read_to_end(&mut cpio).context("gzip decode")?;
+        } else {
+            lz4_flex::frame::FrameDecoder::new(compressed).read_to_end(&mut cpio).context("lz4 decode")?;
+        }
         let mut entries = Vec::new();
         let mut rest = Cursor::new(cpio.as_slice());
         loop {
@@ -85,6 +91,22 @@ impl Ramdisk {
     /// unpacker reads no other LZ4 framing) at its highest compression.
     pub fn encode(&self) -> Result<Vec<u8>> {
         lz4_tool(&self.archive()?)
+    }
+
+    /// Pack as a gzip newc archive.
+    pub fn encode_gzip(&self) -> Result<Vec<u8>> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&self.archive()?).context("gzip archive")?;
+        encoder.finish().context("gzip finish")
+    }
+
+    /// Pack with the compression `original` used.
+    pub fn encode_like(&self, original: &[u8]) -> Result<Vec<u8>> {
+        if original.starts_with(&[0x1f, 0x8b]) {
+            self.encode_gzip()
+        } else {
+            self.encode()
+        }
     }
 
     /// Pack as a newc archive, uncompressed.
@@ -319,6 +341,17 @@ mod tests {
         assert_eq!((bin.mode, bin.data.as_slice()), (S_IFREG | 0o750, b"binary".as_slice()));
         assert_eq!(back.find("dev/console").unwrap().rdev, (5, 1));
         assert!(rd.add("system/bin/recovery", 0o644, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn gzip_round_trip_keeps_metadata() {
+        let mut rd = Ramdisk { entries: Vec::new() };
+        rd.add("system/bin/recovery", 0o750, b"binary".to_vec()).unwrap();
+        let packed = rd.encode_gzip().unwrap();
+        assert_eq!(&packed[..2], &[0x1f, 0x8b]);
+        let back = Ramdisk::decode(&packed).unwrap();
+        assert_eq!(back.find("system/bin/recovery").unwrap().data, b"binary");
+        assert_eq!(back.find("system/bin/recovery").unwrap().mode, S_IFREG | 0o750);
     }
 
     /// What the reference `lz4` tool unpacks `packed` to.

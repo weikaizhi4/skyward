@@ -2520,8 +2520,10 @@ dependencies = [
  "abootimg-oxide",
  "anyhow",
  "cpio",
+ "flate2",
  "libc",
  "lz4_flex 0.14.0",
+ "sha1 0.10.7",
  "tempfile",
 ]
 
