@@ -1,0 +1,18 @@
+[device]
+codename = "p21h170"
+brand = "EEBBK"
+model = "EEBBK X3/X5/X6A/A6/A7"
+ab = false
+soc = { hans = "UNISOC T610", hant = "UNISOC T610", en = "UNISOC T610" }
+os_version_prop = "ro.build.version.incremental"
+
+[display]
+width = 1280
+height = 1752
+density = 320
+diagonal = 11.6
+corner_radius = 0
+
+[modules]
+sources = ["vendor_boot", "vendor"]
+load = []

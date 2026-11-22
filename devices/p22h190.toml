@@ -1,0 +1,18 @@
+[device]
+codename = "p22h190"
+brand = "EEBBK"
+model = "EEBBK A2/X2/X2 Pro"
+ab = false
+soc = { hans = "UNISOC T610", hant = "UNISOC T610", en = "UNISOC T610" }
+os_version_prop = "ro.build.version.incremental"
+
+[display]
+width = 1200
+height = 1920
+density = 320
+diagonal = 10.1
+corner_radius = 0
+
+[modules]
+sources = ["vendor_boot", "vendor_dlkm", "vendor"]
+load = []
