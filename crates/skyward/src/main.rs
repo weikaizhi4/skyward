@@ -166,9 +166,6 @@ enum Cmd {
     /// China, the first of the time zones the settings offer.
     #[cfg(target_os = "android")]
     Clock,
-    /// Mount the data partition directly when it is unencrypted.
-    #[cfg(target_os = "android")]
-    DataOpen,
     /// Start MTP and switch the port to mtp,adb for testing.
     #[cfg(target_os = "android")]
     MtpTest,
@@ -353,16 +350,6 @@ fn real_main() -> Result<()> {
             Ok(())
         }
         #[cfg(target_os = "android")]
-        Cmd::DataOpen => {
-            let opening = skyward_crypto::data::open_plain()?;
-            match &opening.mounted {
-                Some(m) => println!("mounted {} as {}", m.mapped.display(), m.filesystem),
-                None => println!("already mounted"),
-            }
-            println!("{} users still closed", opening.closed.len());
-            Ok(())
-        }
-        #[cfg(target_os = "android")]
         Cmd::MtpTest => {
             let cfg = DeviceConfig::load("/skyward/device.toml")?;
             let info = skyward_info::collect(&cfg)?;
@@ -458,8 +445,13 @@ fn real_main() -> Result<()> {
         Cmd::Data { credential, close: false } => {
             use skyward_crypto::data;
             let binder = skyward_binder::driver::Binder::open()?;
-            let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
-            let opening = data::open_without_credential(&service)?;
+            // A partition the phone's table has encrypted in no way opens
+            // with no key service.
+            let service = match data::keyed()? {
+                true => Some(skyward_crypto::keymint::KeyMint::open(&binder)?),
+                false => None,
+            };
+            let opening = data::open_without_credential(service.as_ref())?;
             match &opening.mounted {
                 Some(mounted) => {
                     if let Some(checked) = &mounted.checked {
@@ -472,8 +464,8 @@ fn real_main() -> Result<()> {
             }
             let mut closed = opening.closed;
             let asked = closed.iter().find(|c| !c.made_up).map(|c| c.user);
-            if let (Some(credential), Some(user)) = (&credential, asked) {
-                closed = data::unlock(&service, &closed, user, credential.as_bytes())?;
+            if let (Some(credential), Some(user), Some(service)) = (&credential, asked, &service) {
+                closed = data::unlock(service, &closed, user, credential.as_bytes())?;
             }
             for c in &closed {
                 match &c.why {
