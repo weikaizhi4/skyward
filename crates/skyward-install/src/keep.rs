@@ -40,6 +40,7 @@ impl Kept {
         let (held, image) = match current {
             Slot::A => (a, image_a),
             Slot::B => (b, image_b),
+            Slot::Single => anyhow::bail!("a phone with one copy of its partitions has no recovery slot"),
         };
         Ok(held.skyward.then(|| Kept { dir: dir.to_path_buf(), image, own: held.digest, before: [a, b] }))
     }

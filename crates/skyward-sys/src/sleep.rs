@@ -58,7 +58,8 @@ pub struct Sleeper {
 
 impl Sleeper {
     pub fn start() -> Result<Sleeper> {
-        fs::write(MEM_SLEEP, "s2idle").with_context(|| format!("write s2idle to {MEM_SLEEP}"))?;
+        // Missing s2idle is not fatal.
+        let _ = fs::write(MEM_SLEEP, "s2idle");
         let (tell, told) = worker::telling().context("make the sleeper's wake pipe")?;
         let leave = Arc::new((Mutex::new(Leave { allowed: false, not_before: Instant::now() }), Condvar::new()));
         let shared = leave.clone();

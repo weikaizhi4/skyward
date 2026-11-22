@@ -28,6 +28,8 @@ pub fn set_mtp(on: bool) {
 /// Ask init for `config` and wait until it is in place. Going to "none"
 /// also waits for adbd to be gone, so its function is free.
 pub fn set(config: &str, timeout: Duration) -> Result<()> {
+    // Stock MTP rules need this at 0 before adbd can restart.
+    set_prop("sys.usb.config_disable", "0")?;
     set_prop("sys.usb.config", config)?;
     wait_prop("sys.usb.state", config, timeout)?;
     if config == "none" {
@@ -45,5 +47,12 @@ pub fn set(config: &str, timeout: Duration) -> Result<()> {
 /// once the programs behind the new configuration are ready.
 pub fn switch(config: &str, timeout: Duration) -> Result<()> {
     set("none", timeout)?;
-    set(config, timeout)
+    match set(config, timeout) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Leave adb on if the target config fails.
+            let _ = set("adb", timeout);
+            Err(e)
+        }
+    }
 }

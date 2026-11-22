@@ -82,7 +82,8 @@ const HELD_SCREENSHOTS: &str = "/skyward/run/screenshots";
 
 /// The panel backlight under /sys/class/backlight.
 struct Backlight {
-    path: PathBuf,
+    /// Brightness file; `None` if the kernel exposes no backlight.
+    path: Option<PathBuf>,
     /// The raw level at the top of the slider: the panel's normal maximum.
     top: u32,
     /// The raw level last written; at first the one the bootloader left.
@@ -91,18 +92,21 @@ struct Backlight {
 
 impl Backlight {
     fn open() -> Result<Self> {
-        let mut dirs: Vec<PathBuf> = fs::read_dir("/sys/class/backlight")
-            .context("read /sys/class/backlight")?
-            .map(|e| e.map(|e| e.path()))
-            .collect::<std::io::Result<_>>()?;
+        let mut dirs: Vec<PathBuf> = match fs::read_dir("/sys/class/backlight") {
+            Ok(entries) => entries.map(|e| e.map(|e| e.path())).collect::<std::io::Result<_>>()?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e).context("read /sys/class/backlight"),
+        };
         dirs.sort();
-        // Qualcomm panels expose panel0-backlight; take it when present.
-        let dir = dirs
+        let Some(dir) = dirs
             .iter()
             .find(|d| d.file_name().is_some_and(|n| n == "panel0-backlight"))
             .or(dirs.first())
-            .ok_or_else(|| anyhow!("no backlight device"))?
-            .clone();
+            .cloned()
+        else {
+            // No backlight node: leave the panel as the bootloader left it.
+            return Ok(Backlight { path: None, top: 1, level: 1 });
+        };
         let read = |name: &str| -> Result<u32> {
             fs::read_to_string(dir.join(name))
                 .with_context(|| format!("read {}/{name}", dir.display()))?
@@ -110,17 +114,18 @@ impl Backlight {
                 .parse()
                 .with_context(|| format!("parse {name}"))
         };
-        let top = normal_max(read("max_brightness")?)?;
-        let level = read("brightness")?;
-        Ok(Backlight { path: dir.join("brightness"), top, level })
+        let top = normal_max(read("max_brightness").unwrap_or(1))?;
+        let level = read("brightness").unwrap_or(0);
+        Ok(Backlight { path: Some(dir.join("brightness")), top, level })
     }
 
     /// Light the panel at `level` of its normal maximum, or turn it off
     /// with `None`. The file is written only when the raw level changes.
     fn show(&mut self, level: Option<f32>) -> Result<()> {
+        let Some(path) = &self.path else { return Ok(()) };
         let raw = level.map_or(0, |v| ((v.clamp(0.0, 1.0) * self.top as f32).round() as u32).max(1));
         if raw != self.level {
-            fs::write(&self.path, raw.to_string()).with_context(|| format!("write {}", self.path.display()))?;
+            fs::write(path, raw.to_string()).with_context(|| format!("write {}", path.display()))?;
             eprintln!("backlight {raw}");
             self.level = raw;
         }
@@ -149,7 +154,8 @@ const NORMAL_MAX: [(&str, &str); 3] = [
 /// display driver booted with gives that maximum in the device tree.
 fn normal_max(max: u32) -> Result<u32> {
     let param = "/sys/module/msm_drm/parameters/dsi_display0";
-    let boot = fs::read_to_string(param).with_context(|| format!("read {param}"))?;
+    // Qualcomm names the panel; other kernels use the full range.
+    let Ok(boot) = fs::read_to_string(param) else { return Ok(max) };
     // The panel's node, then its configuration after a colon, as in
     // "qcom,mdss_dsi_m1_42_02_0a_dsc_cmd:"; the driver takes no name
     // without the colon either.

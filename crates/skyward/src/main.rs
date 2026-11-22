@@ -166,6 +166,12 @@ enum Cmd {
     /// China, the first of the time zones the settings offer.
     #[cfg(target_os = "android")]
     Clock,
+    /// Mount the data partition directly when it is unencrypted.
+    #[cfg(target_os = "android")]
+    DataOpen,
+    /// Start MTP and switch the port to mtp,adb for testing.
+    #[cfg(target_os = "android")]
+    MtpTest,
     /// Say whether a service has registered with the phone's service
     /// directory, such as android.hardware.security.keymint.IKeyMintDevice/default.
     #[cfg(target_os = "android")]
@@ -224,6 +230,19 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    #[cfg(target_os = "android")]
+    std::panic::set_hook(Box::new(|info| {
+        let _ = skyward_sys::kmsg(&format!("skyward panic: {info}"));
+    }));
+    let result = real_main();
+    if let Err(e) = &result {
+        #[cfg(target_os = "android")]
+        let _ = skyward_sys::kmsg(&format!("skyward failed: {e:#}"));
+    }
+    result
+}
+
+fn real_main() -> Result<()> {
     // init starts the recovery service by path with no arguments.
     let started_as = std::env::args_os().next().unwrap_or_default();
     let name = Path::new(&started_as).file_name().unwrap_or_default();
@@ -331,6 +350,38 @@ fn main() -> Result<()> {
         Cmd::Clock => {
             let ms = skyward_sys::clock::set_from_rtc()?;
             println!("{}", skyward_ui::fmt::datetime(skyward_ui::Lang::En, (ms / 1000) as i64, 0));
+            Ok(())
+        }
+        #[cfg(target_os = "android")]
+        Cmd::DataOpen => {
+            let opening = skyward_crypto::data::open_plain()?;
+            match &opening.mounted {
+                Some(m) => println!("mounted {} as {}", m.mapped.display(), m.filesystem),
+                None => println!("already mounted"),
+            }
+            println!("{} users still closed", opening.closed.len());
+            Ok(())
+        }
+        #[cfg(target_os = "android")]
+        Cmd::MtpTest => {
+            let cfg = DeviceConfig::load("/skyward/device.toml")?;
+            let info = skyward_info::collect(&cfg)?;
+            let device = skyward_mtp::Device {
+                manufacturer: cfg.device.brand.clone(),
+                model: info.model.clone(),
+                version: format!("Skyward {}", skyward_info::VERSION),
+                serial: skyward_sys::prop("ro.serialno").unwrap_or_default(),
+                name: info.model.clone(),
+                battery: Box::new(|| skyward_info::battery_now().ok().flatten().map(|b| b.level)),
+            };
+            let service = skyward_mtp::Service::start(device, skyward_ui::fmt::rules(0).clone())?;
+            skyward_sys::usb::set_mtp(true);
+            service.offer(Some(skyward_mtp::Storage { top: std::path::PathBuf::from("/sdcard"), description: "Internal storage".into() }))?;
+            let switched = skyward_sys::usb::switch("mtp,adb", std::time::Duration::from_secs(5));
+            std::fs::write("/tmp/mtp-test.txt", format!("{switched:?}\nstate={:?}\n", skyward_sys::prop("sys.usb.state")))?;
+            skyward_sys::usb::set_mtp(false);
+            let _ = skyward_sys::usb::switch("adb", std::time::Duration::from_secs(5));
+            println!("mtp test done");
             Ok(())
         }
         #[cfg(target_os = "android")]
@@ -534,7 +585,10 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     // The drivers ask for their firmware by name, and the kernel looks only
     // in folders of its own unless told to pass on what it does not find
     // there to ueventd, which looks in the recovery's firmware folders.
-    std::fs::write(FIRMWARE_FALLBACK, "1").with_context(|| format!("write 1 to {FIRMWARE_FALLBACK}"))?;
+    if let Err(e) = std::fs::write(FIRMWARE_FALLBACK, "1") {
+        // Some kernels lack the firmware fallback switch.
+        skyward_sys::kmsg(&format!("firmware fallback not set: {e:#}"))?;
+    }
     if let Some(firmware) = &cfg.firmware {
         mount_firmware(&firmware.partition)?;
     }
@@ -725,8 +779,16 @@ const BUILD_VERSION: [&str; 3] = ["ro.build.version.release", "ro.build.version.
 fn adopt_installed_version(props: &std::collections::HashMap<String, String>) -> Result<()> {
     for name in BUILD_VERSION {
         let value = props.get(name).with_context(|| format!("the installed system says no {name}"))?;
+        if value.is_empty() {
+            skyward_sys::kmsg(&format!("{name} is empty in the installed system; left unset"))?;
+            continue;
+        }
         if skyward_sys::prop(name).as_ref() != Some(value) {
-            skyward_sys::set_prop(name, value)?;
+            // ro. properties are set once; keep going without this one.
+            if let Err(e) = skyward_sys::set_prop(name, value) {
+                skyward_sys::kmsg(&format!("{name} left as it is: {e:#}"))?;
+                continue;
+            }
         }
         skyward_sys::kmsg(&format!("{name} is the installed system's {value}"))?;
     }
@@ -817,7 +879,9 @@ fn recovery() -> Result<()> {
             // shared blocks, which writes to the slot's own.
             let mut programs = cfg.services.clone();
             if !matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {
-                programs.extend(prepare(&cfg, booted_slot()?)?);
+                // Single-copy partitions use an empty slot suffix.
+                let slot = skyward_vab::current_slot()?.unwrap_or(skyward_vab::Slot::Single);
+                programs.extend(prepare(&cfg, slot)?);
             }
             let root = Path::new("/");
             ui::run(&cfg, &programs, &root.join(ramdisk::FONT), &root.join(ramdisk::MONO), request, Screen::Home, None)
@@ -847,7 +911,11 @@ fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<Vec<skyward_co
             for m in &mounts.partitions {
                 skyward_sys::kmsg(&format!("mounted {} on {} ({})", m.partition, m.mount_point.display(), m.filesystem))?;
             }
-            let found = secure::libraries().and_then(|libraries| keys::found(slot, libraries.as_deref()));
+            let found = match slot {
+                // No slot means no keys to read; this is not a bring-up error.
+                skyward_vab::Slot::Single => Ok(keys::Found { described: Vec::new(), steps: Ok(Vec::new()) }),
+                _ => secure::libraries().and_then(|libraries| keys::found(slot, libraries.as_deref())),
+            };
             let steps = found.as_ref().ok().and_then(|found| found.steps.as_deref().ok());
             let programs = steps.map(keys::programs).unwrap_or_default();
             // Without them the screen still shows and the keys still work,

@@ -20,6 +20,8 @@ pub use snapshots::Merge;
 pub enum Slot {
     A,
     B,
+    /// One copy of each partition, with no slot suffix.
+    Single,
 }
 
 impl Slot {
@@ -27,6 +29,7 @@ impl Slot {
         match self {
             Slot::A => "_a",
             Slot::B => "_b",
+            Slot::Single => "",
         }
     }
 
@@ -34,6 +37,7 @@ impl Slot {
         match self {
             Slot::A => "A",
             Slot::B => "B",
+            Slot::Single => "-",
         }
     }
 
@@ -42,6 +46,7 @@ impl Slot {
         match self {
             Slot::A => 0,
             Slot::B => 1,
+            Slot::Single => 0,
         }
     }
 
@@ -49,6 +54,7 @@ impl Slot {
         match self {
             Slot::A => Slot::B,
             Slot::B => Slot::A,
+            Slot::Single => Slot::Single,
         }
     }
 
