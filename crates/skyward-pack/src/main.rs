@@ -9,7 +9,96 @@ use std::path::{Path, PathBuf};
 mod avb;
 mod described;
 
-use skyward_bootimg::{BootImage, Ramdisk};
+use skyward_bootimg::{BootImage, Ramdisk, VendorBootImage};
+
+/// A stock image Skyward can be built on: a boot/recovery image with
+/// `ANDROID!`, or a vendor_boot image with `VNDRBOOT` whose vendor ramdisk
+/// is the recovery ramdisk on some Unisoc phones.
+enum StockImage {
+    Boot(BootImage),
+    Vendor(VendorBootImage),
+}
+
+impl StockImage {
+    fn read(path: &Path) -> Result<Self> {
+        let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        if bytes.starts_with(b"VNDRBOOT") {
+            Ok(StockImage::Vendor(VendorBootImage::parse(&bytes).with_context(|| format!("read {}", path.display()))?))
+        } else {
+            Ok(StockImage::Boot(BootImage::parse(&bytes).with_context(|| format!("read {}", path.display()))?))
+        }
+    }
+
+    fn ramdisk(&self) -> &[u8] {
+        match self {
+            StockImage::Boot(image) => &image.ramdisk,
+            StockImage::Vendor(image) => &image.ramdisk,
+        }
+    }
+
+    fn set_ramdisk(&mut self, ramdisk: Vec<u8>) {
+        match self {
+            StockImage::Boot(image) => image.ramdisk = ramdisk,
+            StockImage::Vendor(image) => image.ramdisk = ramdisk,
+        }
+    }
+
+    fn set_dtb(&mut self, dtb: Vec<u8>) {
+        match self {
+            StockImage::Boot(image) => image.dtb = dtb,
+            StockImage::Vendor(image) => image.dtb = dtb,
+        }
+    }
+
+    fn set_kernel(&mut self, kernel: Vec<u8>) -> Result<()> {
+        match self {
+            StockImage::Boot(image) => {
+                image.kernel = kernel;
+                Ok(())
+            }
+            StockImage::Vendor(_) => anyhow::bail!("a vendor_boot image has no kernel to replace"),
+        }
+    }
+
+    fn append_cmdline(&mut self, text: &str) -> Result<()> {
+        match self {
+            StockImage::Boot(image) => image.append_cmdline(text),
+            StockImage::Vendor(image) => image.append_cmdline(text),
+        }
+    }
+
+    fn to_bytes(&self) -> Result<Vec<u8>> {
+        match self {
+            StockImage::Boot(image) => image.to_bytes(),
+            StockImage::Vendor(image) => image.to_bytes(),
+        }
+    }
+
+    fn partition_name(&self) -> &'static str {
+        match self {
+            StockImage::Boot(_) => "recovery",
+            StockImage::Vendor(_) => "vendor_boot",
+        }
+    }
+
+    fn header_version(&self) -> u32 {
+        match self {
+            StockImage::Boot(image) => image.header_version(),
+            StockImage::Vendor(image) => image.header_version(),
+        }
+    }
+
+    fn kernel_len(&self) -> usize {
+        match self {
+            StockImage::Boot(image) => image.kernel.len(),
+            StockImage::Vendor(_) => 0,
+        }
+    }
+
+    fn ramdisk_len(&self) -> usize {
+        self.ramdisk().len()
+    }
+}
 
 /// Builds Skyward recovery images from a device's own stock images.
 #[derive(Parser)]
@@ -68,6 +157,33 @@ enum Cmd {
         /// The monospaced typeface's licence, which goes with it.
         #[arg(long)]
         mono_license: PathBuf,
+        /// Append `androidboot.selinux=permissive` to the cmdline.
+        #[arg(long)]
+        permissive: bool,
+        /// Replace the DTB section.
+        #[arg(long)]
+        dtb: Option<PathBuf>,
+        /// Replace the kernel with a raw ARM64 Image.
+        #[arg(long)]
+        kernel: Option<PathBuf>,
+        /// Start adbd in the recovery domain before the service.
+        #[arg(long)]
+        debug_adbd: bool,
+        /// Start adbd early in its stock domain.
+        #[arg(long)]
+        early_adbd: bool,
+        /// Point adbd's shell context at `u:r:adbd:s0`.
+        #[arg(long)]
+        patch_adbd_shell: bool,
+        /// Keep the stock cmdline, prop.default and adbd binary; add only
+        /// rules guarded by ro.bootmode=recovery. For a vendor_boot ramdisk
+        /// that the normal system also uses.
+        #[arg(long)]
+        recovery_only: bool,
+        /// Debug only: append unconditional early-init/init/boot rules that
+        /// force adbd up, even if the recovery service never starts.
+        #[arg(long)]
+        force_adbd: bool,
         #[arg(long)]
         out: PathBuf,
     },
@@ -110,25 +226,45 @@ fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::List { image } => list(&image),
         Cmd::Cat { image, path } => {
-            let rd = Ramdisk::decode(&BootImage::read(&image)?.ramdisk)?;
+            let img = StockImage::read(&image)?;
+            let rd = Ramdisk::decode(img.ramdisk())?;
             let e = rd.find(&path).with_context(|| format!("{path} is not in the ramdisk"))?;
             std::io::stdout().write_all(&e.data)?;
             Ok(())
         }
         Cmd::Repack { image, out } => {
-            let mut img = BootImage::read(&image)?;
-            img.ramdisk = Ramdisk::decode(&img.ramdisk)?.encode()?;
+            let mut img = StockImage::read(&image)?;
+            let stock = img.ramdisk().to_vec();
+            img.set_ramdisk(Ramdisk::decode(&stock)?.encode_like(&stock)?);
             write(&out, &img, &img.to_bytes()?)
         }
         Cmd::Boot { kernel, ramdisk, out } => {
             let mut img = BootImage::read(&ramdisk)?;
             img.kernel = BootImage::read(&kernel)?.kernel;
-            write(&out, &img, &img.to_bytes()?)
+            write_boot(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, out } => {
+        Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, permissive, dtb, kernel, debug_adbd, early_adbd, patch_adbd_shell, recovery_only, force_adbd, out } => {
             let size = partition_size(&stock)?;
-            let mut img = BootImage::read(&stock)?;
-            let mut rd = Ramdisk::decode(&img.ramdisk)?;
+            let mut img = StockImage::read(&stock)?;
+            if !recovery_only {
+                if let Some(kernel) = kernel {
+                    img.set_kernel(std::fs::read(&kernel).with_context(|| format!("read {}", kernel.display()))?)?;
+                }
+                if let Some(dtb) = dtb {
+                    img.set_dtb(std::fs::read(&dtb).with_context(|| format!("read {}", dtb.display()))?);
+                }
+                if permissive {
+                    img.append_cmdline("androidboot.selinux=permissive")?;
+                }
+            }
+            let mut rd = Ramdisk::decode(img.ramdisk())?;
+            if force_adbd {
+                let init_rc = "system/etc/init/hw/init.rc";
+                let entry = rd.find(init_rc).with_context(|| format!("{init_rc} is not in the ramdisk"))?;
+                let mut text = String::from_utf8(entry.data.clone()).context("init.rc is not UTF-8")?;
+                text.push_str("\n# Skyward debug: force adbd up even if recovery never starts.\non early-init\n    setprop sys.usb.config_disable 0\n    setprop sys.usb.config adb\non init\n    start adbd\non boot\n    start adbd\n");
+                rd.replace(init_rc, text.into_bytes())?;
+            }
             // A stock recovery ramdisk has no third-party tree; refuse to build
             // on top of another custom recovery.
             if let Some(e) = rd.entries.iter().find(|e| e.name == "FFiles" || e.name.starts_with("twres")) {
@@ -154,23 +290,118 @@ fn main() -> Result<()> {
             if rd.find(paths::TASK_PROFILES).is_none() {
                 rd.add(paths::TASK_PROFILES, 0o644, TASK_PROFILES.to_vec())?;
             }
-            rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
-            // On an unlocked device adbd keeps root when ro.secure is 0 and
-            // lets any computer in without authorization when ro.adb.secure is
-            // 0; init lets a later line of a property file override an earlier
-            // one. update_engine refuses a package built before the recovery
-            // itself unless both of the last two are set; the recovery checks
-            // packages against the installed system instead.
-            let stock_props = &rd
-                .find(paths::PROP_DEFAULT)
-                .with_context(|| format!("{} is not in the ramdisk", paths::PROP_DEFAULT))?
-                .data;
-            let mut props = without(stock_props, &BUILD_VERSION);
-            props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
-            rd.replace(paths::PROP_DEFAULT, props)?;
-            img.ramdisk = rd.encode()?;
+            if recovery_only {
+                // The vendor_boot ramdisk is used by the normal system too.
+                // Keep the cmdline, prop.default and adbd binary stock; every
+                // added rule is guarded by ro.bootmode=recovery.
+                rd.add(paths::MTP_RC, 0o644, MTP_RC_RECOVERY.to_vec())?;
+                rd.add("system/etc/init/skyward-recovery.rc", 0o644, RECOVERY_ONLY_RC.to_vec())?;
+                rd.add(
+                    "system/bin/skyward-permissive",
+                    0o755,
+                    b"#!/system/bin/sh\nsetenforce 0 2>/dev/null\necho 0 > /sys/fs/selinux/enforce 2>/dev/null\ntouch /dev/skyward-permissive\n".to_vec(),
+                )?;
+                // The user confirmed the vendor_boot prop.default is not
+                // read by the normal system on this phone. Keep the stock
+                // cmdline and adbd, but let recovery's adbd keep root.
+                let stock_props = &rd
+                    .find(paths::PROP_DEFAULT)
+                    .with_context(|| format!("{} is not in the ramdisk", paths::PROP_DEFAULT))?
+                    .data;
+                // Keep the stock build/version lines in place: the normal
+                // system may read this vendor_boot prop.default too, and a
+                // missing ro.vendor.build.security_patch can stop its
+                // keymaster/vold early. Only append the recovery adbd
+                // settings; the later line wins in init's property map.
+                let mut props = stock_props.to_vec();
+                props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nservice.adb.root=1\nro.ota.allow_downgrade=true\n");
+                rd.replace(paths::PROP_DEFAULT, props)?;
+                if early_adbd {
+                    rd.add("system/etc/init/skyward-adbd.rc", 0o644, ADBD_RECOVERY_RC.to_vec())?;
+                }
+                // Put the permissive switch before class_start recovery in
+                // the recovery's own init, so Skyward itself starts after it.
+                let common = "init.recovery.common.rc";
+                if let Some(entry) = rd.find(common) {
+                    let text = String::from_utf8(entry.data.clone()).context("init.recovery.common.rc is not UTF-8")?;
+                    let old = "on property:ro.bootmode=recovery\n    class_start recovery";
+                    let new = "on property:ro.bootmode=recovery\n    exec - root root -- /system/bin/skyward-permissive\n    wait /dev/skyward-permissive 5\n    class_start recovery";
+                    if text.contains(old) {
+                        rd.replace(common, text.replace(old, new).into_bytes())?;
+                    } else {
+                        eprintln!("warning: {common} has no ro.bootmode=recovery class_start recovery block");
+                    }
+                }
+            } else {
+                rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
+                // On an unlocked device adbd keeps root when ro.secure is 0 and
+                // lets any computer in without authorization when ro.adb.secure is
+                // 0; init lets a later line of a property file override an earlier
+                // one. update_engine refuses a package built before the recovery
+                // itself unless both of the last two are set; the recovery checks
+                // packages against the installed system instead.
+                let stock_props = &rd
+                    .find(paths::PROP_DEFAULT)
+                    .with_context(|| format!("{} is not in the ramdisk", paths::PROP_DEFAULT))?
+                    .data;
+                let mut props = without(stock_props, &BUILD_VERSION);
+                props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
+                if debug_adbd || early_adbd {
+                    props.extend_from_slice(b"service.adb.root=1\n");
+                    // Start adbd from the phone's own recovery init, so adb is
+                    // there even when the recovery service fails.
+                    let early: Vec<String> = rd
+                        .entries
+                        .iter()
+                        .map(|e| e.name.clone())
+                        .filter(|n| n.starts_with("init.recovery.") && n.ends_with(".rc") && !n.contains("common") && !n.contains("usb") && !n.contains("service") && !n.contains("logd") && !n.contains("ldconfig") && !n.contains("mksh") && !n.contains("vold_decrypt") && !n.contains("hlthchrg"))
+                        .collect();
+                    let rc = b"\n# Skyward debug: adb before the recovery service.\non init\n    setprop sys.usb.config adb\non boot\n    start adbd\n";
+                    if early.is_empty() {
+                        // Some Unisoc vendor_boot ramdisks carry only
+                        // init.recovery.common.rc; a file under /system/etc/init
+                        // is parsed by init just the same.
+                        rd.add("system/etc/init/skyward-adbd.rc", 0o644, rc.to_vec())?;
+                    } else {
+                        for name in early {
+                            let mut data = rd.find(&name).expect("the entry was just found").data.clone();
+                            data.extend_from_slice(rc);
+                            rd.replace(&name, data)?;
+                        }
+                    }
+                }
+                if patch_adbd_shell {
+                    let adbd = rd.find("system/bin/adbd").with_context(|| "system/bin/adbd is not in the ramdisk")?;
+                    let mut data = adbd.data.clone();
+                    let old = b"u:r:shell:s0";
+                    let new = b"u:r:adbd:s0\0";
+                    ensure!(data.windows(old.len()).filter(|w| *w == old).count() == 1, "adbd holds no single u:r:shell:s0");
+                    let at = data.windows(old.len()).position(|w| w == old).expect("the string was just counted");
+                    data[at..at + old.len()].copy_from_slice(new);
+                    rd.replace("system/bin/adbd", data)?;
+                }
+                if debug_adbd {
+                    // A user build's recovery policy has neither su nor a
+                    // usable shell subprocess domain; adbd aborts when it tries
+                    // to switch the shell to it. Run adbd itself in the
+                    // recovery domain, which exists, so the switch is skipped.
+                    // (This domain may not start adbd at all on some policies;
+                    // prefer early_adbd when only `adb pull` is needed.)
+                    let init_rc = "system/etc/init/hw/init.rc";
+                    let rc = rd.find(init_rc).with_context(|| format!("{init_rc} is not in the ramdisk"))?;
+                    let text = String::from_utf8(rc.data.clone()).context("init.rc is not UTF-8")?;
+                    let text = text
+                        .replace("--root_seclabel=u:r:su:s0", "--root_seclabel=u:r:recovery:s0")
+                        .replace("seclabel u:r:adbd:s0", "seclabel u:r:recovery:s0");
+                    rd.replace(init_rc, text.into_bytes())?;
+                }
+                rd.replace(paths::PROP_DEFAULT, props)?;
+            }
+            let stock = img.ramdisk().to_vec();
+            img.set_ramdisk(rd.encode_like(&stock)?);
             let bytes = img.to_bytes()?;
-            write(&out, &img, &avb::footed(&bytes, "recovery", size, &Sha256::digest(&bytes))?)
+            let partition = img.partition_name();
+            write(&out, &img, &avb::footed(&bytes, partition, size, &Sha256::digest(&bytes))?)
         }
         Cmd::Stock { config, out } => {
             let stock = skyward_config::DeviceConfig::load(&config)?.stock.with_context(|| format!("{} names no stock build", config.display()))?;
@@ -231,7 +462,7 @@ fn partition_size(stock: &Path) -> Result<usize> {
     }
     ensure!(
         &magic == b"AVBf",
-        "{} does not end in an AVB footer; give the whole recovery partition, as the phone or a full update package holds it",
+        "{} does not end in an AVB footer; give the whole partition, as the phone or a full update package holds it",
         stock.display()
     );
     Ok(usize::try_from(size)?)
@@ -255,6 +486,15 @@ const TASK_PROFILES: &[u8] = include_bytes!("task_profiles.json");
 /// stock recovery does not offer.
 const MTP_RC: &[u8] = include_bytes!("mtp.rc");
 
+/// File transfer rules that run only when the phone booted into recovery.
+const MTP_RC_RECOVERY: &[u8] = include_bytes!("mtp-recovery.rc");
+
+/// Early adbd, only when the phone booted into recovery.
+const ADBD_RECOVERY_RC: &[u8] = include_bytes!("adbd-recovery.rc");
+
+/// The recovery-only permissive switch.
+const RECOVERY_ONLY_RC: &[u8] = include_bytes!("recovery-only.rc");
+
 /// A property file without the lines that set any of `names`.
 fn without(props: &[u8], names: &[&str]) -> Vec<u8> {
     let mut out = Vec::with_capacity(props.len());
@@ -267,8 +507,8 @@ fn without(props: &[u8], names: &[&str]) -> Vec<u8> {
     out
 }
 
-/// Write `bytes`, the image `img` makes, to `out`.
-fn write(out: &Path, img: &BootImage, bytes: &[u8]) -> Result<()> {
+/// Write `bytes`, the boot image `img` makes, to `out`.
+fn write_boot(out: &Path, img: &BootImage, bytes: &[u8]) -> Result<()> {
     std::fs::write(out, bytes).with_context(|| format!("write {}", out.display()))?;
     println!(
         "wrote {} ({} bytes kernel, {} bytes ramdisk, {} bytes in all)",
@@ -280,20 +520,31 @@ fn write(out: &Path, img: &BootImage, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn list(image: &Path) -> Result<()> {
-    let img = BootImage::read(image)?;
-    let h = &img.header;
+/// Write `bytes`, the stock image `img` makes, to `out`.
+fn write(out: &Path, img: &StockImage, bytes: &[u8]) -> Result<()> {
+    std::fs::write(out, bytes).with_context(|| format!("write {}", out.display()))?;
     println!(
-        "header v{}  kernel {} bytes  ramdisk {} bytes  {:?}",
-        h.header_version(),
-        img.kernel.len(),
-        img.ramdisk.len(),
-        h.osversionpatch
+        "wrote {} ({} bytes kernel, {} bytes ramdisk, {} bytes in all)",
+        out.display(),
+        img.kernel_len(),
+        img.ramdisk_len(),
+        bytes.len()
     );
-    if img.ramdisk.is_empty() {
+    Ok(())
+}
+
+fn list(image: &Path) -> Result<()> {
+    let img = StockImage::read(image)?;
+    println!(
+        "header v{}  kernel {} bytes  ramdisk {} bytes",
+        img.header_version(),
+        img.kernel_len(),
+        img.ramdisk_len()
+    );
+    if img.ramdisk().is_empty() {
         return Ok(());
     }
-    let rd = Ramdisk::decode(&img.ramdisk)?;
+    let rd = Ramdisk::decode(img.ramdisk())?;
     for e in &rd.entries {
         println!("{:06o} {:>5}:{:<5} {:>10}  {}", e.mode, e.uid, e.gid, e.data.len(), e.name);
     }

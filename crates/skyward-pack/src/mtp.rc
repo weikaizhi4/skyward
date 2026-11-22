@@ -1,7 +1,16 @@
 # File transfer: an MTP function beside adb. Skyward serves the function
 # itself; once it has written the descriptors it sets sys.usb.ffs.mtp.ready,
 # and with adbd ready too, init binds the two together.
+on init
+    setprop sys.usb.config_disable 0
+
 on fs && property:sys.usb.configfs=1
+    mkdir /config/usb_gadget/g1/functions/ffs.mtp
+    mkdir /dev/usb-ffs/mtp 0770 root root
+    mount functionfs mtp /dev/usb-ffs/mtp rmode=0770,fmode=0660,uid=0,gid=0
+
+# Stock init may set sys.usb.configfs=1 after fs; create MTP here too.
+on property:sys.usb.configfs=1 && property:sys.usb.config=adb
     mkdir /config/usb_gadget/g1/functions/ffs.mtp
     mkdir /dev/usb-ffs/mtp 0770 root root
     mount functionfs mtp /dev/usb-ffs/mtp rmode=0770,fmode=0660,uid=0,gid=0

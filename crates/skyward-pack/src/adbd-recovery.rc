@@ -1,0 +1,5 @@
+# Bring adb up in recovery only; the normal system must keep its own USB and
+# adbd setup untouched.
+on property:ro.bootmode=recovery
+    setprop sys.usb.config adb
+    start adbd

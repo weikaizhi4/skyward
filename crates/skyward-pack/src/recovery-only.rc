@@ -1,0 +1,5 @@
+# Recovery-only permissive switch. This file is in the vendor_boot ramdisk,
+# which the normal system also reads, so the trigger is ro.bootmode=recovery.
+on property:ro.bootmode=recovery
+    exec - root root -- /system/bin/setenforce 0
+    write /sys/fs/selinux/enforce 0
