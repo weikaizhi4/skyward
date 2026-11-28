@@ -1,8 +1,8 @@
 use crate::app::{
     Action, BackupAt, BackupEnd, BackupJob, Check, ClashChoice, Confirm, Damage, Data, Dock, DownloadEnd, EraseStop, Field, FileKind,
-    FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Rows, Screen,
-    SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink, Wipe, ADDABLE,
-    BACKUP_PARTS, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, SCREEN_OFF, TARGETS, TIME_ZONES, WIPES, installs, starting,
+    FileOp, FileTask, Fold, Folder, Frame, FsAction, FsChoice, FsRow, Have, HeroArt, Hit, Install, JobEnd, Keys, Pick, Place, Region, Rows,
+    Screen, SkywardCheck, SkywardEnd, SkywardJob, SkywardStage, Slider, Source, State, Switch, SystemsWork, Target, UsbDrive, UsbLink, Wipe,
+    ADDABLE, BACKUP_PARTS, DATA_PART, DATA_PARTITION, DOWNLOADS, FASTBOOT_CHOICES, MEDIA_PART, SCREEN_OFF, TARGETS, TIME_ZONES, UTC, WIPES, installs, listed, starting,
 };
 use crate::canvas::Canvas;
 use crate::color::Rgba;
@@ -19,7 +19,7 @@ use crate::theme::Theme;
 use crate::icons::{self, Icon};
 use crate::widgets::{self, Caption, Detail, Fact, Outline, Row, Spec, SystemCard, SystemMark, Tone, Trail};
 use skyward_info::{DeviceInfo, VERSION};
-use skyward_install::{Outcome, Reflash, Refusal, Stage};
+use skyward_install::{Outcome, Place as FlashPlace, Reflash, Refusal, Stage};
 use skyward_net::download::Progress;
 use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Bands, Network, Power, Stage as Joining};
@@ -90,6 +90,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::PartWork => part_work(cx),
         Screen::Language => language(cx),
         Screen::TimeZone => time_zone(cx),
+        Screen::TimeZones(region) => time_zones(cx, region),
         Screen::Logs => logs(cx),
         Screen::Update => update(cx),
         Screen::SkywardUpdate => skyward_update(cx),
@@ -351,7 +352,7 @@ pub fn settings(cx: &Ctx) -> Frame {
     y = widgets::section(&mut c, t, f, vibration.bottom, l.pick(texts::settings::GENERAL));
     let general = widgets::list(&mut c, t, f, y, &[
         Row::new(l.pick(texts::page::LANGUAGE)).icon(BLUE, Icon::Globe).trail(Trail::Value(l.name())),
-        Row::new(l.pick(texts::page::TIME_ZONE)).icon(ORANGE, Icon::Clock).trail(Trail::Value(l.pick(TIME_ZONES[s.time_zone].0))),
+        Row::new(l.pick(texts::page::TIME_ZONE)).icon(ORANGE, Icon::Clock).trail(Trail::Value(s.zone_name())),
     ]);
     out.extend(hits(&general.rows, &[Action::Open(Screen::Language), Action::Open(Screen::TimeZone)]));
     y = widgets::section(&mut c, t, f, general.bottom, "USB");
@@ -894,7 +895,10 @@ fn update_stage(l: Lang, stage: Option<&Stage>) -> (String, Option<f32>) {
         }
         Some(Stage::Finishing) => (l.pick(texts::installing::UPDATE_FINISHING).into(), None),
         Some(Stage::Reflashing { done, total }) => (l.pick(texts::installing::REFLASHING).into(), Some(*done as f32 / *total as f32)),
-        Some(Stage::Flashing { .. } | Stage::Script { .. } | Stage::Signature { .. } | Stage::Allocating { .. } | Stage::Root { .. } | Stage::Storing) | None => {
+        Some(
+            Stage::Resizing | Stage::Flashing { .. } | Stage::Script { .. } | Stage::Signature { .. } | Stage::Allocating { .. } | Stage::Root { .. } | Stage::Storing,
+        )
+        | None => {
             (l.pick(texts::installing::GETTING_READY).into(), None)
         }
     }
@@ -1053,26 +1057,40 @@ pub fn installing(cx: &Ctx) -> Frame {
         }
         Install::Choosing(choice) => {
             let (name, holds) = fmt::image_kind(l, choice.kind);
-            let detail = texts::installing::size_and_holds(l, fmt::bytes(choice.size), holds);
+            let detail = texts::installing::size_and_holds(l, fmt::bytes(choice.size), &holds);
             let y = widgets::list(&mut c, t, f, top, &[standing(name, GREEN, Icon::Install, &detail)]).bottom;
             let y = widgets::section(&mut c, t, f, y, l.pick(texts::flash::PARTITION));
             let rows: Vec<Row> = choice
                 .partitions
                 .iter()
                 .enumerate()
-                .map(|(k, p)| Row::new(p).subtitle(fmt::partition_role(l, p)).trail(Trail::Check(k == choice.partition)))
+                .map(|(k, p)| Row::new(&p.name).subtitle(fmt::partition_role(l, p)).trail(Trail::Check(k == choice.partition)))
                 .collect();
             let parts = widgets::list(&mut c, t, f, y, &rows);
             let choose: Vec<Action> = (0..choice.partitions.len()).map(Action::FlashPartition).collect();
             out.extend(hits(&parts.rows, &choose));
-            let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(texts::slot::TITLE));
-            let titles = Pick::ALL.map(|p| pick_title(l, p, i.slot));
-            let rows: Vec<Row> =
-                Pick::ALL.iter().zip(&titles).map(|(p, title)| Row::new(title).trail(Trail::Check(*p == choice.pick))).collect();
-            let picks = widgets::list(&mut c, t, f, y, &rows);
-            out.extend(hits(&picks.rows, &Pick::ALL.map(Action::FlashSlots)));
+            // A partition the phone has in each slot goes to the slots
+            // picked, and a logical one to the slot the phone runs from,
+            // which is shown with nothing to pick; super is in no slot.
+            let bottom = match choice.partitions[choice.partition].place {
+                FlashPlace::Slotted => {
+                    let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(texts::slot::TITLE));
+                    let titles = Pick::ALL.map(|p| pick_title(l, p, i.slot));
+                    let rows: Vec<Row> =
+                        Pick::ALL.iter().zip(&titles).map(|(p, title)| Row::new(title).trail(Trail::Check(*p == choice.pick))).collect();
+                    let picks = widgets::list(&mut c, t, f, y, &rows);
+                    out.extend(hits(&picks.rows, &Pick::ALL.map(Action::FlashSlots)));
+                    picks.bottom
+                }
+                FlashPlace::Logical => {
+                    let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(texts::slot::TITLE));
+                    let title = pick_title(l, Pick::Current, i.slot);
+                    widgets::list(&mut c, t, f, y, &[Row::new(&title).trail(Trail::Check(true))]).bottom
+                }
+                FlashPlace::Single => parts.bottom,
+            };
             let (label, danger) = confirm_label(Confirm::Flash, cx.state);
-            let track = widgets::confirm(&mut c, t, f, picks.bottom + t.m.dp(28.0), label, danger, s.confirm);
+            let track = widgets::confirm(&mut c, t, f, bottom + t.m.dp(28.0), label, danger, s.confirm);
             out.push(Hit { rect: track, action: Action::Confirm(Confirm::Flash) });
             let note = l.pick(match s.source {
                 Source::Computer => texts::flash::OVERWRITES_ENDS_SIDELOAD,
@@ -1210,7 +1228,7 @@ pub fn installing(cx: &Ctx) -> Frame {
             }
             widgets::footnote(&mut c, t, f, y, l.pick(texts::installing::MORE_COMMANDS))
         }
-        Install::Finished { outcome, damage } => finished(&mut c, cx, top, outcome, *damage, &mut out, &mut rows),
+        Install::Finished { outcome, damage } => finished(&mut c, cx, top, outcome, damage.as_ref(), &mut out, &mut rows),
     };
     // What the system asked for says why, where it said.
     let bottom = match (s.source, &s.asked.reason) {
@@ -1242,7 +1260,7 @@ fn finished(
     cx: &Ctx,
     top: f32,
     outcome: &Outcome,
-    damage: Option<Damage>,
+    damage: Option<&Damage>,
     out: &mut Vec<Hit>,
     rows: &mut Option<Rows>,
 ) -> f32 {
@@ -1270,6 +1288,7 @@ fn finished(
         }
         Outcome::Flashed { partition, slots } => {
             let detail = match slots.as_slice() {
+                [] => installed::flashed_whole(l, partition),
                 [slot] => installed::flashed_one(l, partition, slot.letter()),
                 [a, b] => installed::flashed_two(l, partition, a.letter(), b.letter()),
                 other => unreachable!("a phone has two slots, and the image went to {other:?}"),
@@ -1310,7 +1329,7 @@ fn finished(
             next.bottom
         }
         Outcome::Refused(r) => {
-            let reason = fmt::refusal(l, r, &cx.info.codename, source, cx.state.time_zone);
+            let reason = fmt::refusal(l, r, &cx.info.codename, source, cx.state.zone());
             let y = widgets::list(c, t, f, top, &[standing(l.pick(installed::CANT_INSTALL), ORANGE, Icon::Install, &reason)]).bottom;
             // What the system asked for and did not go in leaves the phone
             // where it was, from which it may go back to the system.
@@ -1492,13 +1511,13 @@ pub fn backup(cx: &Ctx) -> Frame {
     let top = t.m.content_top;
     let y = widgets::section_first(&mut c, t, f, top, l.pick(texts::backup::CONTENTS));
     let system = fmt::snapshot_backup_note(l, &i.snapshot).unwrap_or(l.pick(texts::backup::SYSTEM_HOLDS));
-    let data = l.pick(match s.data == Data::Open {
-        true => texts::backup::DATA_HOLDS,
-        false => texts::backup::DATA_HOLDS_LOCKED,
-    });
+    let (data, media) = match s.data == Data::Open {
+        true => (texts::backup::DATA_HOLDS, texts::backup::MEDIA_HOLDS),
+        false => (texts::backup::DATA_HOLDS_LOCKED, texts::backup::MEDIA_HOLDS_LOCKED),
+    };
     let boot = l.pick(texts::backup::BOOT_HOLDS);
     let modem = l.pick(texts::backup::MODEM_HOLDS);
-    let subs = [boot, system, data, modem];
+    let subs = [boot, system, l.pick(data), l.pick(media), modem];
     let rows: Vec<Row> = BACKUP_PARTS
         .iter()
         .zip(subs)
@@ -1506,7 +1525,7 @@ pub fn backup(cx: &Ctx) -> Frame {
         .map(|(k, (name, sub))| Row::new(l.pick(*name)).subtitle(sub).trail(Trail::Check(s.backup[k])))
         .collect();
     let parts = widgets::list(&mut c, t, f, y, &rows);
-    out.extend(hits(&parts.rows, &[0, 1, 2, 3].map(Action::BackupPart)));
+    out.extend(hits(&parts.rows, &[0, 1, 2, 3, 4].map(Action::BackupPart)));
     let y = widgets::section(&mut c, t, f, parts.bottom, l.pick(texts::backup::SAVE_TO));
     let storage = match (s.data.storage_open(), i.storage.free.map(fmt::gb)) {
         (true, Some(free)) => texts::backup::free(l, free),
@@ -1552,7 +1571,7 @@ pub fn restore(cx: &Ctx) -> Frame {
             .backups
             .iter()
             .map(|b| match &b.held {
-                Ok(h) => (fmt::datetime(l, h.made, s.time_zone), format!("{} · {} · {}", fmt::parts(l, &h.parts), fmt::bytes(h.size), place_name(l, b.place))),
+                Ok(h) => (fmt::datetime(l, h.made, s.zone()), format!("{} · {} · {}", fmt::parts(l, &h.parts), fmt::bytes(h.size), place_name(l, b.place))),
                 Err(_) => (b.name.clone(), format!("{} · {}", l.pick(texts::common::UNREADABLE), place_name(l, b.place))),
             })
             .collect();
@@ -1583,7 +1602,7 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
         }
         Ok(held) => {
             let mut facts = vec![
-                (l.pick(texts::restore::MADE), fmt::datetime(l, held.made, s.time_zone)),
+                (l.pick(texts::restore::MADE), fmt::datetime(l, held.made, s.zone())),
                 (l.pick(texts::common::SIZE), fmt::bytes(held.size)),
                 (location, place_name(l, entry.place).to_string()),
             ];
@@ -1603,8 +1622,11 @@ pub fn restore_backup(cx: &Ctx) -> Frame {
                 let list = widgets::list(&mut c, t, f, y, &rows);
                 out.extend(list.rows.iter().zip(&kept).map(|(&rect, &k)| Hit { rect, action: Action::RestorePart(k) }));
                 let mut y = widgets::footnote(&mut c, t, f, list.bottom, l.pick(texts::restore::OVERWRITES));
-                if chosen[2] {
+                if chosen[DATA_PART] {
                     y = widgets::footnote(&mut c, t, f, y, l.pick(texts::restore::DATA_NOTE));
+                }
+                if chosen[MEDIA_PART] {
+                    y = widgets::footnote(&mut c, t, f, y, l.pick(texts::restore::MEDIA_NOTE));
                 }
                 // The boot partitions' vbmeta checks the system's: one of
                 // another version without the other may not start.
@@ -2701,7 +2723,7 @@ pub fn row(screen: Screen, cx: &Ctx, i: usize, c: &mut Canvas) {
         Screen::Files | Screen::Choose(_) => {
             let folder = cx.state.folder(screen);
             let entries = folder.entries.as_ref().expect("a folder listed draws its rows");
-            files::row(c, cx.t, cx.f, cx.state.lang, &entries[i], folder.listed, cx.state.time_zone);
+            files::row(c, cx.t, cx.f, cx.state.lang, &entries[i], folder.listed, cx.state.zone());
         }
         Screen::Installing => widgets::output_row(c, cx.t, cx.f, &cx.state.script_output, i),
         Screen::PartWork => {
@@ -2731,7 +2753,7 @@ pub fn file_info(cx: &Ctx) -> Frame {
         FileKind::Folder { items: None } => facts.push((holds, l.pick(texts::common::UNREADABLE).to_string())),
         FileKind::File | FileKind::Special => facts.push((l.pick(texts::common::SIZE), texts::files::size(l, e.size, fmt::file_size(e.size)))),
     }
-    facts.push((l.pick(texts::files::MODIFIED), fmt::datetime(l, e.modified, s.time_zone)));
+    facts.push((l.pick(texts::files::MODIFIED), fmt::datetime(l, e.modified, s.zone())));
     facts.push((l.pick(texts::files::PERMISSIONS), texts::files::owned_by(l, fmt::mode(e.mode), e.uid, e.gid)));
     let y = widgets::info_card(&mut c, t, f, top, &facts);
     let mut rows = Vec::new();
@@ -2947,20 +2969,60 @@ pub fn language(cx: &Ctx) -> Frame {
 }
 
 /// The time zone the status bar's clock and the times on the pages keep.
+/// On a phone whose installed system's zone is known, a switch follows it
+/// and tells which it is; a phone with no system, or one that has set no
+/// zone, shows none. Under it a zone is chosen from a part of the world,
+/// whose row names the zone kept while that is one of its own.
 pub fn time_zone(cx: &Ctx) -> Frame {
     let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
     let mut c = long_page(cx);
+    let mut out = Vec::new();
     let top = t.m.content_top;
-    let rows: Vec<Row> = TIME_ZONES
-        .iter()
-        .enumerate()
-        .map(|(k, &(name, cities, _))| Row::new(l.pick(name)).subtitle(l.pick(cities)).trail(Trail::Check(k == s.time_zone)))
-        .collect();
-    let list = widgets::list(&mut c, t, f, top, &rows);
-    let picks: Vec<Action> = (0..TIME_ZONES.len()).map(Action::TimeZone).collect();
-    let out = hits(&list.rows, &picks);
-    let bottom = widgets::footnote(&mut c, t, f, list.bottom, l.pick(texts::time_zone::NOTE));
+    let y = match &s.system_zone {
+        Some(zone) => {
+            let name = listed(&zone.name).map_or(zone.name.as_str(), |at| l.pick(TIME_ZONES[at].name));
+            let system = format!("{} · {name}", fmt::utc_offset(s.now, &zone.rules));
+            let follow = Row::new(l.pick(texts::time_zone::FOLLOW_SYSTEM)).subtitle(&system).trail(Trail::Switch(s.follow_system_zone));
+            let follow = widgets::list(&mut c, t, f, top, &[follow]);
+            out.extend(hits(&follow.rows, &[Action::Toggle(Switch::SystemTimeZone)]));
+            widgets::section(&mut c, t, f, follow.bottom, l.pick(texts::time_zone::CHOOSE))
+        }
+        None => top,
+    };
+    let kept = s.zone_listed();
+    let rows = Region::ALL.map(|region| {
+        let row = Row::new(l.pick(region.name()));
+        match kept.filter(|&at| TIME_ZONES[at].region == Some(region)) {
+            Some(at) => row.trail(Trail::Value(l.pick(TIME_ZONES[at].name))),
+            None => row,
+        }
+    });
+    let regions = widgets::list(&mut c, t, f, y, &rows);
+    out.extend(hits(&regions.rows, &Region::ALL.map(|region| Action::Open(Screen::TimeZones(region)))));
+    let utc = listed(UTC).expect("UTC is a zone listed");
+    let offset = fmt::utc_offset(s.now, fmt::rules(utc));
+    let universal = Row::new(l.pick(TIME_ZONES[utc].name)).subtitle(&offset).trail(Trail::Check(kept == Some(utc)));
+    let universal = widgets::list(&mut c, t, f, regions.bottom + t.m.card_gap, &[universal]);
+    out.extend(hits(&universal.rows, &[Action::TimeZone(utc)]));
+    let bottom = widgets::footnote(&mut c, t, f, universal.bottom, l.pick(texts::time_zone::NOTE));
     Frame::new(t, fit(c, t, bottom), out, l.pick(texts::page::TIME_ZONE), top)
+}
+
+/// The time zones of one part of the world, from the one furthest behind
+/// UTC now to the one furthest ahead, each with how far that is and the
+/// cities it is known by.
+pub fn time_zones(cx: &Ctx, region: Region) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = long_page(cx);
+    let top = t.m.content_top;
+    let mut zones: Vec<usize> = (0..TIME_ZONES.len()).filter(|&at| TIME_ZONES[at].region == Some(region)).collect();
+    zones.sort_by_key(|&at| fmt::utc_offset_seconds(s.now, fmt::rules(at)));
+    let lines: Vec<String> = zones.iter().map(|&at| format!("{} · {}", fmt::utc_offset(s.now, fmt::rules(at)), l.pick(TIME_ZONES[at].cities))).collect();
+    let kept = s.zone_listed();
+    let rows: Vec<Row> = zones.iter().zip(&lines).map(|(&at, line)| Row::new(l.pick(TIME_ZONES[at].name)).subtitle(line).trail(Trail::Check(kept == Some(at)))).collect();
+    let list = widgets::list(&mut c, t, f, top, &rows);
+    let picks: Vec<Action> = zones.iter().map(|&at| Action::TimeZone(at)).collect();
+    Frame::new(t, fit(c, t, list.bottom), hits(&list.rows, &picks), l.pick(region.name()), top)
 }
 
 /// Saving the logs, as a bug report asks for them.
@@ -3446,7 +3508,7 @@ mod tests {
         r.outcome = Some(BackupEnd::Failed("write /dev/block/by-name/boot_b".into()));
         assert_eq!(states(&r), ["未完成", "未恢复"]);
         r.at = None;
-        r.outcome = Some(BackupEnd::Refused(BackupRefusal::DataReset));
+        r.outcome = Some(BackupEnd::Refused(BackupRefusal::OlderAndroid { was: "17".into(), now: "16".into() }));
         assert_eq!(states(&r), ["未开始", "未开始"]);
     }
 

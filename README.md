@@ -36,13 +36,23 @@ zstd use to flash it, and an `unzip` whose `-p` streams the image as it reads it
 They also get `avbctl` and `resetprop`, to turn off verified boot's checks and to
 read and set properties.
 
+A partition image is told by what it holds. Images of boot, init_boot,
+vendor_boot, recovery, dtbo, vbmeta and of a whole super each go to their own
+partition. One that holds an erofs, ext4 or f2fs filesystem goes to any logical
+partition the running slot has in super, which is first made as large as the
+image, as fastbootd makes it. An image that tells nothing of itself goes to the
+partition its file is named after, as `modem.img` goes to modem, where the phone
+has that partition in both slots or as a logical one in super. An image in the
+sparse format is expanded as it is written. While a system update waits to be
+merged, super and the logical partitions in it are not flashed.
+
 ### Online updates
 
 ![Update the system and Skyward online](slides/en/out/05-updates.png)
 
 ### Backup and restore
 
-![Back up the system, apps and IMEI](slides/en/out/06-backup.png)
+![Back up the system, apps, photos and IMEI](slides/en/out/06-backup.png)
 
 ### File manager
 
@@ -95,6 +105,7 @@ read and set properties.
 | --- | --- | --- |
 | Xiaomi 17 Ultra | `nezha` | OS4.0.4.0.XPACNXM (Android 17) |
 | Xiaomi 13 Ultra | `ishtar` | OS3.0.308.0.WMACNXM (Android 16) |
+| REDMI K60 Pro | `socrates` | OS4.0.0.24.XMKCNXM (Android 17) |
 
 ### 🚧 Under construction
 
@@ -136,8 +147,8 @@ phone's model and codename, such as Xiaomi 17 Ultra (nezha). Check it against
 the slot the phone runs from, with the phone in fastboot mode:
 
 ```sh
-unzip skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.zip
-fastboot flash recovery skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.img
+unzip skyward-v0.5.1-nezha-OS4.0.4.0.XPACNXM.zip
+fastboot flash recovery skyward-v0.5.1-nezha-OS4.0.4.0.XPACNXM.img
 fastboot reboot recovery
 ```
 
@@ -256,7 +267,7 @@ adb, its data partition open, `cargo ndk` pushes each test program to the phone 
 runs it there, one test at a time:
 
 ```sh
-cargo ndk -t arm64-v8a --platform 30 test -p skyward -p skyward-block -p skyward-files -p skyward-mtp on_the_phone -- --test-threads=1
+cargo ndk -t arm64-v8a --platform 30 test -p skyward -p skyward-block -p skyward-files -p skyward-install -p skyward-mtp -p skyward-vab on_the_phone -- --test-threads=1
 ```
 
 `skyward-preview` draws the pages on the computer, as PNG files, without a phone:

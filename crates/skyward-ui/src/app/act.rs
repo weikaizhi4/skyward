@@ -48,6 +48,17 @@ impl App {
                 self.refresh();
                 return vec![Effect::Wlan(on)];
             }
+            // The zone the system's gave the clock stays as the one chosen,
+            // where it is one the pages list.
+            Action::Toggle(Switch::SystemTimeZone) => {
+                if self.state.follow_system_zone
+                    && let Some(at) = self.state.zone_listed()
+                {
+                    self.state.time_zone = at;
+                }
+                self.state.follow_system_zone.toggle();
+                self.refresh();
+            }
             Action::Toggle(switch) => {
                 let on = match switch {
                     Switch::Vibrate => &mut self.state.vibrate,
@@ -57,7 +68,7 @@ impl App {
                     Switch::Signature => &mut self.state.check_signature,
                     Switch::KeepRecovery => &mut self.state.keep_recovery,
                     Switch::ShowPassword => &mut self.state.show_password,
-                    Switch::Wlan => unreachable!("the WLAN switch is turned above"),
+                    Switch::Wlan | Switch::SystemTimeZone => unreachable!("the switch is turned above"),
                 };
                 *on = !*on;
                 let now_on = *on;
@@ -241,6 +252,7 @@ impl App {
             }
             Action::TimeZone(k) => {
                 self.state.time_zone = k;
+                self.state.follow_system_zone = false;
                 self.refresh();
             }
             Action::Language(l) => {
@@ -249,7 +261,7 @@ impl App {
                 self.refresh();
             }
             Action::BackupPart(k) => {
-                self.state.backup[k] = !self.state.backup[k];
+                self.state.backup[k].toggle();
                 self.refresh();
             }
             Action::BackupTo(place) => {
@@ -259,14 +271,14 @@ impl App {
             // All a backup holds is ticked to restore at first.
             Action::OpenBackup(i) => {
                 let entry = self.state.backups[i].clone();
-                let parts = entry.held.as_ref().map_or([false; 4], |h| h.parts);
+                let parts = entry.held.as_ref().map_or([false; 5], |h| h.parts);
                 self.state.restore = Some((entry, parts));
                 self.state.asking_delete = false;
                 self.open(Screen::RestoreBackup);
             }
             Action::RestorePart(k) => {
                 let (_, parts) = self.state.restore.as_mut().expect("the restore page shows a backup");
-                parts[k] = !parts[k];
+                parts[k].toggle();
                 self.refresh();
             }
             Action::StopBackup => {
@@ -278,7 +290,7 @@ impl App {
                 }
             }
             Action::LogPart(k) => {
-                self.state.logs[k] = !self.state.logs[k];
+                self.state.logs[k].toggle();
                 self.refresh();
             }
             Action::LogsTo(k) => {
@@ -722,7 +734,7 @@ impl App {
                 let s = &self.state;
                 let refused = if !s.backup.contains(&true) {
                     Some(texts::toast::CHOOSE_BACKUP)
-                } else if s.backup[2] && s.data != Data::Open {
+                } else if (s.backup[DATA_PART] || s.backup[MEDIA_PART]) && s.data != Data::Open {
                     Some(texts::toast::DECRYPT_TO_BACK_UP)
                 } else if s.place_open(s.backup_to) {
                     None
@@ -743,9 +755,15 @@ impl App {
             Confirm::Restore => {
                 let (entry, parts) = self.state.restore.as_ref().expect("the restore page shows a backup");
                 let restore = Effect::Restore { place: entry.place, name: entry.name.clone(), parts: *parts };
+                // The files of the data partition and of internal storage go
+                // back into a data partition that is open: one erased is
+                // made again by the system, as it next starts.
+                let files = parts[DATA_PART] || parts[MEDIA_PART];
                 if !parts.contains(&true) {
                     self.say(l.pick(texts::toast::CHOOSE_RESTORE), now);
-                } else if parts[2] && self.state.data != Data::Open {
+                } else if files && self.state.data == Data::Erased {
+                    self.say(l.pick(texts::toast::RESTORE_ONCE_MADE), now);
+                } else if files && self.state.data != Data::Open {
                     self.say(l.pick(texts::toast::DECRYPT_TO_RESTORE), now);
                 } else {
                     fx.push(restore);
@@ -790,9 +808,9 @@ impl App {
             }
             Confirm::Flash => {
                 if let Install::Choosing(choice) = &self.state.install {
-                    let partition = choice.partitions[choice.partition];
-                    fx.push(Effect::Flash { partition, pick: choice.pick });
-                    self.state.install = Install::Flashing { partition, stage: None };
+                    let FlashTarget { name, place } = choice.partitions[choice.partition].clone();
+                    fx.push(Effect::Flash { partition: name.clone(), place, pick: choice.pick });
+                    self.state.install = Install::Flashing { partition: name, stage: None };
                     self.refresh();
                 }
             }
